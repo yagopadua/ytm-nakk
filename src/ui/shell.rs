@@ -464,6 +464,15 @@ pub fn top_bar(app: &mut App, ui: &mut Ui) {
             if resp.clicked() {
                 app.actions.push(Action::Go(Page::Settings));
             }
+            // A fresh home feed, like reloading the page on YouTube Music: same
+            // request, and the server answers with different picks. It spins while
+            // the reply is on its way.
+            if app.page == Page::Home {
+                let spin = if app.home_loading { ui.input(|i| i.time) as f32 * 5.0 } else { 0.0 };
+                if widgets::refresh_button(ui, 18.0, "Refresh home", spin).clicked() {
+                    app.actions.push(Action::RefreshHome);
+                }
+            }
             if app.loading {
                 ui.add_space(10.0);
                 ui.spinner();

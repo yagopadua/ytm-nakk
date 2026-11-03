@@ -129,6 +129,9 @@ fn main() -> eframe::Result {
                     c.request_repaint();
                 }
             };
+            // A shortcut press has to wake the UI itself: while the window is
+            // minimized or hidden egui draws no frames, so nothing would poll it.
+            hotkeys::install_wake(wake);
 
             // Jam links from later launches arrive over a pipe (first instance only).
             deeplink::listen(wake);

@@ -1,6 +1,8 @@
 /target
 
 installer/Output/
+# Local self-signed certificate and its public part (machine-specific).
+installer/signing/
 .claude/
 
 server/target/
@@ -10,3 +12,6 @@ server/.wrangler/
 server/node_modules/
 .playwright-cli/
 target-bisect/
+
+# Shortcuts live in the app data folder; this is the old in-repo location.
+config/hotkeys.json

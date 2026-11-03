@@ -136,6 +136,49 @@ pub fn heart(ui: &Ui, center: Pos2, size: f32, fill: f32, outline: Color32, fill
     }
 }
 
+/// A circular arrow, drawn rather than taken from the icon font (whose subset has no
+/// refresh glyph). `spin` turns it in radians, so it can rotate while reloading.
+pub fn refresh_icon(ui: &Ui, center: Pos2, size: f32, spin: f32, color: Color32) {
+    use std::f32::consts::TAU;
+    let r = size * 0.36;
+    let w = (size * 0.1).max(1.4);
+    let (sin, cos) = spin.sin_cos();
+    let turn = |v: Vec2| vec2(v.x * cos - v.y * sin, v.x * sin + v.y * cos);
+    // Just over three quarters of a circle: the gap at the top right holds the head.
+    let (start, sweep) = (-0.17, TAU * 0.82);
+    let steps = 40;
+    let pts: Vec<Pos2> = (0..=steps)
+        .map(|i| {
+            let t = start + sweep * i as f32 / steps as f32;
+            center + turn(vec2(t.cos(), t.sin()) * r)
+        })
+        .collect();
+    ui.painter().add(egui::Shape::line(pts, egui::Stroke::new(w, color)));
+    // The head sits at the end of the arc, opening against the way it turns.
+    let end = start + sweep;
+    let tip = center + turn(vec2(end.cos(), end.sin()) * (r + w * 0.2));
+    let back = turn(vec2(-end.sin(), end.cos())) * (size * 0.17);
+    let side = turn(vec2(end.cos(), end.sin())) * (size * 0.1);
+    let stroke = egui::Stroke::new(w, color);
+    ui.painter().line_segment([tip, tip - back + side], stroke);
+    ui.painter().line_segment([tip, tip - back - side], stroke);
+}
+
+/// [`icon_button`] with the drawn circular arrow; `spin` rotates it while busy.
+pub fn refresh_button(ui: &mut Ui, size: f32, name: &str, spin: f32) -> Response {
+    let d = size + 16.0;
+    let (rect, resp) = ui.allocate_exact_size(Vec2::splat(d), Sense::click());
+    let resp = named(resp, name).on_hover_text(name).on_hover_cursor(egui::CursorIcon::PointingHand);
+    let h = theme::anim_bool(ui.ctx(), resp.id.with("h"), resp.hovered(), 0.15);
+    if h > 0.0 {
+        ui.painter().circle_filled(rect.center(), d / 2.0, theme::glass(0.10 * h));
+    }
+    let color = theme::lerp_color(theme::text_dim(), theme::TEXT, h);
+    let press = if resp.is_pointer_button_down_on() { 0.9 } else { 1.0 };
+    refresh_icon(ui, rect.center(), size * press, spin, color);
+    resp
+}
+
 /// Circular icon button with an animated hover halo.
 pub fn icon_button(ui: &mut Ui, glyph: char, size: f32, name: &str, active: bool) -> Response {
     let d = size + 16.0;

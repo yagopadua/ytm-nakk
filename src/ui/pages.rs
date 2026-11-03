@@ -850,13 +850,6 @@ fn settings_body(app: &mut App, ui: &mut Ui) {
         setting_row(ui, "Crossfade songs", Some("Blend the end of each song into the start of the next."), |ui| {
             if toggle(ui, &mut app.crossfade, "Crossfade songs").changed() {
                 app.set_crossfade();
-        divider(ui);
-        setting_row(ui, "Global Hotkeys", Some("Configure system-wide keyboard shortcuts."), |ui| {
-            if pill(ui, "Edit Hotkeys", Some(icon::KEYBOARD), false).clicked() {
-                app.show_hotkey_modal = true;
-            }
-        });
-
             }
         });
         if app.crossfade {
@@ -1198,88 +1191,11 @@ fn settings_body(app: &mut App, ui: &mut Ui) {
     // ---- shortcuts
     section_label(ui, "Keyboard shortcuts", None);
     settings_card(ui, |ui| {
-        let config = crate::config::load_config();
-        
-        fn mods_to_strs(mods: u32) -> Vec<String> {
-            let mut res = Vec::new();
-            let m = global_hotkey::hotkey::Modifiers::from_bits_truncate(mods);
-            if m.contains(global_hotkey::hotkey::Modifiers::CONTROL) { res.push("Ctrl".to_string()); }
-            if m.contains(global_hotkey::hotkey::Modifiers::ALT) { res.push("Alt".to_string()); }
-            if m.contains(global_hotkey::hotkey::Modifiers::SHIFT) { res.push("Shift".to_string()); }
-            res
-        }
-
-        fn code_to_str(code: u32) -> String {
-            use global_hotkey::hotkey::Code;
-            let code: Code = unsafe { std::mem::transmute(code as u8) };
-            match code {
-                Code::Space => "Space".to_string(),
-                Code::ArrowUp => "Up".to_string(),
-                Code::ArrowDown => "Down".to_string(),
-                Code::ArrowLeft => "Left".to_string(),
-                Code::ArrowRight => "Right".to_string(),
-                Code::Equal => "+".to_string(),
-                Code::Minus => "-".to_string(),
-                Code::NumpadAdd => "Num +".to_string(),
-                Code::NumpadSubtract => "Num -".to_string(),
-                c => format!("{:?}", c).replace("Key", ""),
-            }
-        }
-
-        let play_mods = mods_to_strs(config.play_pause.0);
-        let next_mods = mods_to_strs(config.next.0);
-        let prev_mods = mods_to_strs(config.prev.0);
-        let vol_up_mods = mods_to_strs(config.vol_up.0);
-        let vol_down_mods = mods_to_strs(config.vol_down.0);
-
-        let mut play_combo = play_mods;
-        play_combo.push(code_to_str(config.play_pause.1));
-
-        let mut next_combo = next_mods;
-        next_combo.push(code_to_str(config.next.1));
-
-        let mut prev_combo = prev_mods;
-        prev_combo.push(code_to_str(config.prev.1));
-
-        let mut vol_up_combo = vol_up_mods;
-        vol_up_combo.push(code_to_str(config.vol_up.1));
-
-        let mut vol_down_combo = vol_down_mods;
-        vol_down_combo.push(code_to_str(config.vol_down.1));
-
-        let keys: &[(&str, Vec<String>, &str)] = &[
-            ("Play / pause", play_combo, "play_pause"),
-            ("Next song", next_combo, "next"),
-            ("Previous song", prev_combo, "prev"),
-            ("Volume up", vol_up_combo, "vol_up"),
-            ("Volume down", vol_down_combo, "vol_down"),
-        ];
-
-        for (i, (what, combo, action_key)) in keys.iter().enumerate() {
-            if i > 0 {
-                divider(ui);
-            }
-            let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 44.0), Sense::hover());
-            ui.painter().text(pos2(rect.left(), rect.center().y), Align2::LEFT_CENTER, *what, theme::regular(14.0), theme::TEXT);
-            let mut x = rect.right();
-            
-            let resp = ui.interact(rect, ui.scope_id().with(action_key), Sense::click());
-            if resp.clicked() {
-                app.hotkey_action_to_edit = Some((*action_key).to_string());
+        setting_row(ui, "Media controls", Some("Play, skip and volume controls that work even when ytm-rs isn't the active window."), |ui| {
+            if pill(ui, "Edit shortcuts", Some(icon::KEYBOARD), false).clicked() {
                 app.show_hotkey_modal = true;
             }
-            if resp.hovered() {
-                ui.painter().rect_filled(rect.shrink2(vec2(0.0, 2.0)), 6.0, theme::glass(0.05));
-            }
-
-            for (j, k) in combo.iter().enumerate().rev() {
-                x = keycap(ui, pos2(x, rect.center().y), k) - 6.0;
-                if j > 0 {
-                    let plus = ui.painter().text(pos2(x, rect.center().y), Align2::RIGHT_CENTER, "+", theme::regular(13.0), theme::text_dim());
-                    x = plus.left() - 6.0;
-                }
-            }
-        }
+        });
     });
 
     // ---- about
@@ -1736,17 +1652,6 @@ fn seconds_slider(ui: &mut Ui, v: &mut u32, range: std::ops::RangeInclusive<u32>
     resp
 }
 
-/// Draw a key cap whose right edge is at `right`; returns its left edge.
-fn keycap(ui: &Ui, right: egui::Pos2, key: &str) -> f32 {
-    let g = widgets::galley(ui, key, theme::semibold(12.5), theme::TEXT, 200.0);
-    let size = vec2((g.size().x + 18.0).max(30.0), 26.0);
-    let rect = Rect::from_min_size(pos2(right.x - size.x, right.y - size.y / 2.0), size);
-    ui.painter().rect_filled(rect, 7.0, theme::glass(0.08));
-    ui.painter().rect_stroke(rect, 7.0, egui::Stroke::new(1.0, theme::glass(0.12)), egui::StrokeKind::Inside);
-    ui.painter().rect_filled(Rect::from_min_max(pos2(rect.left() + 2.0, rect.bottom() - 2.0), pos2(rect.right() - 2.0, rect.bottom())), 2.0, theme::shade(0.25));
-    ui.painter().galley(rect.center() - g.size() / 2.0, g, theme::TEXT);
-    rect.left()
-}
 
 /// Theme preset gallery: one card per preset with its cover, name and creators.
 fn themes(app: &mut App, ui: &mut Ui) {
