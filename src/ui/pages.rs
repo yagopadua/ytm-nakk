@@ -1,13 +1,13 @@
 //! Page bodies. Every page fades and slides in when navigated to.
 
-use std::sync::atomic::Ordering;
 use std::collections::HashSet;
-use crate::backend::compact;
+use std::sync::atomic::Ordering;
 
 use egui::{Align2, Color32, Rect, RichText, Sense, Ui, Vec2, pos2, vec2};
 
 use super::widgets::{self, RowOpts, card, chip, h_scroll, named, paint_cover, pill, shelf_header, track_row};
 use super::{Action, App, LibTab, Page, Selection};
+use crate::backend::compact;
 use crate::model::{Card, ShelfKind, Target, Track};
 use crate::theme::{self, icon};
 
@@ -23,6 +23,8 @@ pub fn page(app: &mut App, ui: &mut Ui, now: f64) {
     let page = app.page.clone();
     // Each page (each album, each search) keeps its own scroll position.
     let mut area = egui::ScrollArea::vertical().id_salt(("page", &page)).auto_shrink(false);
+    // At the window's right edge: clear of where it resizes the window.
+    ui.spacing_mut().scroll.bar_outer_margin += super::titlebar::edge_inset();
     // Dev hook: YTM_SCROLL=<px> pins the page scroll, for screenshots of lower sections.
     if let Some(y) = super::dev_var("YTM_SCROLL").and_then(|v| v.parse::<f32>().ok()) {
         area = area.vertical_scroll_offset(y);
@@ -52,11 +54,11 @@ pub fn page(app: &mut App, ui: &mut Ui, now: f64) {
             if h.loading_more.is_some_and(|t| now - t > 20.0) {
                 h.loading_more = None;
             }
-            if remaining < 700.0 && h.loading_more.is_none() {
-                if let Some(token) = h.continuation.clone() {
-                    h.loading_more = Some(now);
-                    app.backend.request(crate::backend::Req::HomeMore(token));
-                }
+            if remaining < 700.0 && h.loading_more.is_none()
+                && let Some(token) = h.continuation.clone()
+            {
+                h.loading_more = Some(now);
+                app.backend.request(crate::backend::Req::HomeMore(token));
             }
         }
     }
@@ -180,6 +182,7 @@ struct ListCtx<'a> {
 
 /// A long song list; only the rows on screen are built. Clicking one plays `tracks` from it,
 /// or picks it while selecting: Ctrl-click picks one song, Shift-click a run of them.
+#[allow(clippy::too_many_arguments)]
 fn list(ui: &mut Ui, rows: &Rows, liked: &HashSet<String>, tracks: &[Track], show_album: bool, number: impl Fn(usize, &Track) -> Option<usize>, cx: ListCtx, acts: &mut Vec<Action>) {
     let ListCtx { sel, page, own } = cx;
     let selecting = sel.on(page);
@@ -291,19 +294,19 @@ fn selection_bar(app: &mut App, ctx: &egui::Context, page: &Page, area: Rect) {
 // ------------------------------------------------------------------ home
 
 fn home(app: &mut App, ui: &mut Ui, now: f64) {
-    if let Some(h) = &app.home {
-        if !h.chips.is_empty() {
-            ui.add_space(6.0);
-            ui.horizontal_wrapped(|ui| {
-                ui.spacing_mut().item_spacing = vec2(10.0, 10.0);
-                for c in &h.chips {
-                    if chip(ui, &c.title, c.selected).clicked() {
-                        let params = if c.selected { None } else { c.params.clone() };
-                        app.actions.push(Action::HomeChip(params));
-                    }
+    if let Some(h) = &app.home
+        && !h.chips.is_empty()
+    {
+        ui.add_space(6.0);
+        ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().item_spacing = vec2(10.0, 10.0);
+            for c in &h.chips {
+                if chip(ui, &c.title, c.selected).clicked() {
+                    let params = if c.selected { None } else { c.params.clone() };
+                    app.actions.push(Action::HomeChip(params));
                 }
-            });
-        }
+            }
+        });
     }
     // A refresh keeps showing the current feed; the skeleton is only for an empty one.
     if app.home.as_ref().is_none_or(|h| app.home_loading && h.shelves.is_empty()) {
@@ -483,7 +486,7 @@ fn collection(app: &mut App, ui: &mut Ui, id: &str, now: f64) {
         return;
     }
     let rows = Rows::new(app, now);
-    let Some(o) = app.opened.iter().find(|o| o.c.id == id) else { return };
+    let Some(o) = app.lists.get(id) else { return };
     let (c, more) = (&o.c, app.receiving(id));
     let acts = &mut app.actions;
     let tracks = &c.tracks;
@@ -501,7 +504,7 @@ fn collection(app: &mut App, ui: &mut Ui, id: &str, now: f64) {
             ui.label(RichText::new(&c.title).font(theme::bold(40.0)).color(theme::TEXT));
             ui.add_space(2.0);
             let (r, _) = ui.allocate_exact_size(vec2(ui.available_width(), 20.0), Sense::hover());
-            widgets::linked_text(ui, r.min, &c.subtitle, &c.artists, theme::regular(15.0), theme::text_dim(), r.width(), acts);
+            widgets::linked_text(ui, r.min, &c.byline(), &c.artists, theme::regular(15.0), theme::text_dim(), r.width(), acts);
             let total: u32 = tracks.iter().filter_map(|t| t.duration).sum();
             if total > 0 {
                 ui.label(
@@ -524,11 +527,10 @@ fn collection(app: &mut App, ui: &mut Ui, id: &str, now: f64) {
                     super::shuffle(&mut t);
                     acts.push(Action::Play(t, 0));
                 }
-                if let Some(first) = tracks.first() {
-                    if pill(ui, "Radio", Some(icon::RADIO), false).clicked() {
+                if let Some(first) = tracks.first()
+                    && pill(ui, "Radio", Some(icon::RADIO), false).clicked() {
                         acts.push(Action::Radio(first.clone()));
                     }
-                }
                 if pill(ui, "Share", None, false).clicked() {
                     acts.push(Action::Share(target.clone()));
                 }
@@ -545,11 +547,10 @@ fn collection(app: &mut App, ui: &mut Ui, id: &str, now: f64) {
                     });
                     // Saving only applies to someone else's playlist or an album.
                     let save_id = if is_album { c.save_id.clone() } else { (!c.owned).then(|| id.to_owned()) };
-                    if let Some(save_id) = save_id {
-                        if pill(ui, if saved { "Remove from library" } else { "Save to library" }, None, false).clicked() {
+                    if let Some(save_id) = save_id
+                        && pill(ui, if saved { "Remove from library" } else { "Save to library" }, None, false).clicked() {
                             acts.push(Action::SaveCollection(save_id, !saved));
                         }
-                    }
                     // Only your own playlists can be edited or deleted (mixes and others' playlists can't).
                     if !is_album && c.owned {
                         if pill(ui, "Edit", None, false).clicked() { acts.push(Action::EditPlaylist); }
@@ -610,11 +611,10 @@ fn artist(app: &mut App, ui: &mut Ui, id: &str, now: f64) {
             super::shuffle(&mut t);
             acts.push(Action::Play(t, 0));
         }
-        if let Some(first) = top.first() {
-            if pill(ui, "Radio", Some(icon::RADIO), false).clicked() {
+        if let Some(first) = top.first()
+            && pill(ui, "Radio", Some(icon::RADIO), false).clicked() {
                 acts.push(Action::Radio(first.clone()));
             }
-        }
     });
     if !top.is_empty() {
         ui.add_space(26.0);
@@ -726,7 +726,7 @@ fn library(app: &mut App, ui: &mut Ui, tab: LibTab, now: f64) {
                 return;
             }
             let more = app.receiving(super::LIKED_MUSIC);
-            let Some(o) = app.opened.iter().find(|o| o.c.id == super::LIKED_MUSIC) else { return };
+            let Some(o) = app.lists.get(super::LIKED_MUSIC) else { return };
             let liked = &o.c.tracks;
             if !liked.is_empty() {
                 ui.horizontal(|ui| {
@@ -786,8 +786,25 @@ fn settings(app: &mut App, ui: &mut Ui) {
 
 fn settings_body(app: &mut App, ui: &mut Ui) {
     page_title(ui, "Settings");
+    settings_account(app, ui);
+    settings_playback(app, ui);
+    settings_downloads(ui);
+    settings_lyrics(app, ui);
+    settings_appearance(app, ui);
+    settings_window(app, ui);
+    settings_app_icon(app, ui);
+    settings_connections(app, ui);
+    section_label(ui, "Network", None);
+    settings_card(ui, |ui| network(app, ui));
+    super::transfer::settings_section(app, ui);
+    settings_updates(app, ui);
+    settings_shortcuts(app, ui);
+    settings_about(ui);
+    settings_sign_off(app, ui);
+}
 
-    // ---- account
+/// Settings › Account: signing in and out.
+fn settings_account(app: &mut App, ui: &mut Ui) {
     section_label(ui, "Account", None);
     let busy = app.signing_in.load(Ordering::Relaxed);
     let (mut sign_in, mut sign_out) = (false, false);
@@ -817,8 +834,10 @@ fn settings_body(app: &mut App, ui: &mut Ui) {
     if sign_out {
         app.backend.request(crate::backend::Req::Logout);
     }
+}
 
-    // ---- playback
+/// Settings › Playback.
+fn settings_playback(app: &mut App, ui: &mut Ui) {
     section_label(ui, "Playback", None);
     settings_card(ui, |ui| {
         setting_row(ui, "Autoplay", Some("Keep playing similar songs when the queue ends."), |ui| {
@@ -871,8 +890,10 @@ fn settings_body(app: &mut App, ui: &mut Ui) {
             }
         });
     });
+}
 
-    // ---- downloads
+/// Settings › Downloads.
+fn settings_downloads(ui: &mut Ui) {
     section_label(ui, "Downloads", None);
     ui.label(
         RichText::new("Download songs from their menu. They're saved at the best quality your account gets, tagged with their cover art, and play from the file, even offline.")
@@ -892,8 +913,10 @@ fn settings_body(app: &mut App, ui: &mut Ui) {
             }
         });
     });
+}
 
-    // ---- lyrics (the better-lyrics extension's options)
+/// Settings › Lyrics: the better-lyrics extension's options.
+fn settings_lyrics(app: &mut App, ui: &mut Ui) {
     section_label(ui, "Lyrics", None);
     settings_card(ui, |ui| {
         setting_row(ui, "Romanization", Some("Japanese, Korean, Chinese, Cyrillic and other scripts in Latin letters. Timed with the lyrics when the source has it."), |ui| {
@@ -999,8 +1022,10 @@ fn settings_body(app: &mut App, ui: &mut Ui) {
         }
         ui.add_space(6.0);
     });
+}
 
-    // ---- appearance
+/// Settings › Appearance and Theme.
+fn settings_appearance(app: &mut App, ui: &mut Ui) {
     let was_default = app.default_theme;
     let was_theme = app.theme_id.clone();
     section_label(ui, "Appearance", None);
@@ -1028,7 +1053,6 @@ fn settings_body(app: &mut App, ui: &mut Ui) {
         });
     });
 
-    // ---- themes
     let current = if app.default_theme { "Classic".to_owned() } else { crate::preset::get(&app.theme_id).name.clone() };
     section_label(ui, "Theme", Some(&current));
     ui.label(
@@ -1041,8 +1065,10 @@ fn settings_body(app: &mut App, ui: &mut Ui) {
     if (was_default && !app.default_theme) || was_theme != app.theme_id {
         app.request_art();
     }
+}
 
-    // ---- window
+/// Settings › Window.
+fn settings_window(app: &mut App, ui: &mut Ui) {
     section_label(ui, "Window", None);
     settings_card(ui, |ui| {
         setting_row(ui, "Close to tray", Some("Clicking × hides the window and keeps the music playing. Click the tray icon to bring it back, or right-click it to quit."), |ui| {
@@ -1052,9 +1078,36 @@ fn settings_body(app: &mut App, ui: &mut Ui) {
         setting_row(ui, "Collapse sidebar", Some("Show only icons in the sidebar, for narrow windows. The menu button at its top does the same."), |ui| {
             toggle(ui, &mut app.sidebar_collapsed, "Collapse sidebar");
         });
+        divider(ui);
+        let api = crate::renderer::api_name();
+        let title = format!("Draw with {api}");
+        let desc = format!(
+            "Use {api} (wgpu) instead of OpenGL. It isn't faster for this app and takes about three times the memory; try it if OpenGL draws wrong on this PC. If {api} won't start, the app goes back to OpenGL."
+        );
+        setting_row(ui, &title, Some(&desc), |ui| {
+            if toggle(ui, &mut app.wgpu_renderer, &title).changed() {
+                use crate::renderer::Renderer;
+                let r = if app.wgpu_renderer { Renderer::Wgpu } else { Renderer::OpenGl };
+                if let Err(e) = crate::renderer::save(app.backend.data_dir(), r) {
+                    log::warn!("renderer: couldn't save the setting: {e}");
+                }
+            }
+        });
+        if app.wgpu_renderer != (crate::renderer::active() == crate::renderer::Renderer::Wgpu) {
+            divider(ui);
+            let mut restart = false;
+            setting_row(ui, "Restart to apply", Some("The app draws with the new renderer from the next start."), |ui| {
+                restart = pill(ui, "Restart now", None, true).clicked();
+            });
+            if restart {
+                app.restart(ui.ctx());
+            }
+        }
     });
+}
 
-    // ---- app icon
+/// Settings › App icon.
+fn settings_app_icon(app: &mut App, ui: &mut Ui) {
     section_label(ui, "App icon", Some(crate::appicon::get(app.app_icon).name));
     ui.label(
         RichText::new("Changes the icon on the window, taskbar, tray and Start menu. A pinned taskbar icon can take a moment to catch up.")
@@ -1071,8 +1124,10 @@ fn settings_body(app: &mut App, ui: &mut Ui) {
             icon_preview(ui, crate::appicon::get(app.app_icon));
         });
     });
+}
 
-    // ---- connections
+/// Settings › Connections.
+fn settings_connections(app: &mut App, ui: &mut Ui) {
     let mut discord_enabled = app.discord_enabled;
     section_label(ui, "Connections", None);
     settings_card(ui, |ui| {
@@ -1106,15 +1161,10 @@ fn settings_body(app: &mut App, ui: &mut Ui) {
     if discord_enabled != app.discord_enabled {
         app.set_discord_enabled(discord_enabled);
     }
+}
 
-    // ---- network
-    section_label(ui, "Network", None);
-    settings_card(ui, |ui| network(app, ui));
-
-    // ---- import
-    super::transfer::settings_section(app, ui);
-
-    // ---- updates
+/// Settings › Updates.
+fn settings_updates(app: &mut App, ui: &mut Ui) {
     section_label(ui, "Updates", None);
     let state = app.updater.as_ref().map(|u| u.state());
     let installed = super::updatable();
@@ -1187,18 +1237,22 @@ fn settings_body(app: &mut App, ui: &mut Ui) {
     if restart {
         app.restart_to_update(ui.ctx());
     }
+}
 
-    // ---- shortcuts
+/// Settings › Keyboard shortcuts.
+fn settings_shortcuts(app: &mut App, ui: &mut Ui) {
     section_label(ui, "Keyboard shortcuts", None);
     settings_card(ui, |ui| {
         setting_row(ui, "Media controls", Some("Play, skip and volume controls that work even when ytm-rs isn't the active window."), |ui| {
-            if pill(ui, "Edit shortcuts", Some(icon::KEYBOARD), false).clicked() {
+            if pill(ui, "Edit shortcuts", None, false).clicked() {
                 app.show_hotkey_modal = true;
             }
         });
     });
+}
 
-    // ---- about
+/// Settings › About.
+fn settings_about(ui: &mut Ui) {
     section_label(ui, "About", None);
     settings_card(ui, |ui| {
         setting_row(ui, &format!("ytm-rs {}", env!("CARGO_PKG_VERSION")), Some("A fast, native YouTube Music client."), |_| {});
@@ -1212,7 +1266,10 @@ fn settings_body(app: &mut App, ui: &mut Ui) {
             setting_row(ui, title, Some(desc), |_| {});
         }
     });
-    // ---- sign-off, last thing on the page: the app icon, its name and its download count
+}
+
+/// The last thing on the page: the app icon, its name and its download count.
+fn settings_sign_off(app: &mut App, ui: &mut Ui) {
     let downloads = app.updater.as_ref().and_then(|u| u.downloads());
     let text = match downloads {
         Some(1) => "1 download and counting".to_owned(),
@@ -1535,7 +1592,7 @@ fn thousands(n: u64) -> String {
     let s = n.to_string();
     let mut out = String::new();
     for (i, c) in s.chars().enumerate() {
-        if i > 0 && (s.len() - i) % 3 == 0 {
+        if i > 0 && (s.len() - i).is_multiple_of(3) {
             out.push(',');
         }
         out.push(c);
@@ -1651,7 +1708,6 @@ fn seconds_slider(ui: &mut Ui, v: &mut u32, range: std::ops::RangeInclusive<u32>
     ui.painter().circle_filled(knob, 7.0 + h, Color32::WHITE);
     resp
 }
-
 
 /// Theme preset gallery: one card per preset with its cover, name and creators.
 fn themes(app: &mut App, ui: &mut Ui) {

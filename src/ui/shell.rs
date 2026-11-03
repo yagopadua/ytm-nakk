@@ -251,7 +251,7 @@ pub fn sidebar(app: &mut App, ui: &mut Ui) {
                 ui.label(egui::RichText::new("Sign in to see your playlists").color(theme::text_dim()));
                 ui.add_space(8.0);
                 if widgets::pill(ui, "Sign in", Some(icon::CIRCLE_USER), false).clicked() {
-                    app.actions.push(Action::Go(Page::Settings));
+                    app.start_sign_in(ui.ctx());
                 }
             } else {
                 ui.multiply_opacity(2.0 * t - 1.0);
@@ -357,7 +357,12 @@ pub fn top_bar(app: &mut App, ui: &mut Ui) {
         }
         ui.add_space(12.0);
 
-        let width = (ui.available_width() - 70.0).clamp(240.0, 560.0);
+        // Room for the account button, and the window buttons when they're over this row;
+        // in a narrow window the box gives way rather than run under them.
+        let refresh = app.page == Page::Home;
+        let reserve = (if refresh { 90.0 } else { 50.0 }) + super::titlebar::right_gap(ui.ctx(), ui.max_rect(), 20.0);
+        let narrowest = if super::titlebar::custom() { 120.0 } else { 240.0 };
+        let width = (ui.available_width() - reserve).clamp(narrowest, 560.0);
         // Anywhere on the pill focuses the box, not just on the text area inside it.
         let (rect, field) = ui.allocate_exact_size(vec2(width, 42.0), Sense::click());
         let field = field.on_hover_cursor(egui::CursorIcon::Text);
@@ -446,7 +451,7 @@ pub fn top_bar(app: &mut App, ui: &mut Ui) {
         }
 
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            ui.add_space(20.0);
+            ui.add_space(super::titlebar::right_gap(ui.ctx(), ui.max_rect(), 20.0));
             let (r, resp) = ui.allocate_exact_size(Vec2::splat(36.0), Sense::click());
             let resp = named(resp, "Account").on_hover_cursor(egui::CursorIcon::PointingHand);
             let initial = app.account_name.as_deref().and_then(|n| n.chars().next()).unwrap_or('?');
@@ -638,16 +643,16 @@ pub fn player_bar(app: &mut App, ui: &mut Ui, now: f64) {
             over.galley(bg.min + vec2(6.0, 3.0), g, Color32::WHITE);
         }
     }
-    if total > 0.0 {
-        if let Some(p) = resp.interact_pointer_pos() {
-            let t = ((p.x - full.left()) / full.width()).clamp(0.0, 1.0) * total;
-            if resp.dragged() {
-                app.seek_drag = Some(t);
-            }
-            if resp.drag_stopped() || resp.clicked() {
-                app.seek_drag = None;
-                app.actions.push(Action::Seek(t));
-            }
+    if total > 0.0
+        && let Some(p) = resp.interact_pointer_pos()
+    {
+        let t = ((p.x - full.left()) / full.width()).clamp(0.0, 1.0) * total;
+        if resp.dragged() {
+            app.seek_drag = Some(t);
+        }
+        if resp.drag_stopped() || resp.clicked() {
+            app.seek_drag = None;
+            app.actions.push(Action::Seek(t));
         }
     }
 
@@ -750,7 +755,7 @@ pub fn player_bar(app: &mut App, ui: &mut Ui, now: f64) {
     if ctl(ui, -inner, icon::SKIP_BACK, "Previous", false, 22.0) {
         app.prev();
     }
-    let (rep_icon, rep_on) = match app.repeat {
+    let (rep_icon, rep_on) = match app.queue.repeat {
         Repeat::Off => (icon::REPEAT, false),
         Repeat::All => (icon::REPEAT, true),
         Repeat::One => (icon::REPEAT_1, true),
@@ -759,7 +764,7 @@ pub fn player_bar(app: &mut App, ui: &mut Ui, now: f64) {
         app.next();
     }
     if ctl(ui, outer, rep_icon, "Repeat", rep_on, 18.0) {
-        app.repeat = match app.repeat {
+        app.queue.repeat = match app.queue.repeat {
             Repeat::Off => Repeat::All,
             Repeat::All => Repeat::One,
             Repeat::One => Repeat::Off,
@@ -890,10 +895,10 @@ fn volume_slider(app: &mut App, ui: &mut Ui, slider: Rect, salt: &str) {
     let fill = Rect::from_min_size(track_r.min, vec2(track_r.width() * vol, 4.0));
     ui.painter().rect_filled(fill, 2.0, theme::lerp_color(theme::text_dim(), Color32::WHITE, vh));
     ui.painter().circle_filled(pos2(fill.right(), track_r.center().y), 2.0 + 4.5 * vh, Color32::WHITE);
-    if let Some(p) = vresp.interact_pointer_pos() {
-        if vresp.dragged() || vresp.clicked() {
-            app.audio.set_volume(((p.x - track_r.left()) / track_r.width()).clamp(0.0, 1.0));
-        }
+    if let Some(p) = vresp.interact_pointer_pos()
+        && (vresp.dragged() || vresp.clicked())
+    {
+        app.audio.set_volume(((p.x - track_r.left()) / track_r.width()).clamp(0.0, 1.0));
     }
     if vresp.hovered() {
         let scroll = ui.input(|i| i.smooth_scroll_delta.y);
@@ -909,6 +914,8 @@ pub fn queue_drawer(app: &mut App, ui: &mut Ui) {
     ui.horizontal(|ui| {
         ui.label(egui::RichText::new("Up next").font(theme::bold(20.0)));
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            // Left of the window buttons, which sit over the drawer's top right.
+            ui.add_space(super::titlebar::right_gap(ui.ctx(), ui.max_rect(), 0.0));
             if icon_button(ui, icon::X, 16.0, "Close queue", false).clicked() {
                 app.queue_open = false;
             }
@@ -918,27 +925,27 @@ pub fn queue_drawer(app: &mut App, ui: &mut Ui) {
     queue_list(app, ui, "drawer");
 }
 
-
+/// Current track plus everything after it. Shared by the drawer and now playing.
 pub fn queue_list(app: &mut App, ui: &mut Ui, salt: &str) {
     let rows = super::pages::Rows::new(app, ui.input(|i| i.time));
     let mut pending_move: Option<(usize, usize)> = None;
     let drag_source_id = egui::Id::NULL.with("queue_drag_source_index");
 
     egui::ScrollArea::vertical().id_salt(("queue", salt)).auto_shrink(false).show(ui, |ui| {
-        if app.queue.is_empty() {
+        if app.queue.tracks.is_empty() {
             ui.label(egui::RichText::new("Nothing queued yet").color(theme::text_dim()));
             return;
         }
-        let Some(start) = app.index else {
+        let Some(start) = app.queue.index else {
             ui.label(egui::RichText::new("Nothing queued yet").color(theme::text_dim()));
             return;
         };
-        if start >= app.queue.len() {
+        if start >= app.queue.tracks.len() {
             return;
         }
         ui.checkbox(&mut app.autoplay, egui::RichText::new("Autoplay similar songs").color(theme::text_dim())).on_hover_cursor(egui::CursorIcon::PointingHand);
         ui.add_space(6.0);
-        let (queue, liked, acts, has_current, by) = (&app.queue, &app.liked, &mut app.actions, app.index.is_some(), &app.jam.by);
+        let (queue, liked, acts, has_current, by) = (&app.queue.tracks, &app.liked, &mut app.actions, app.queue.index.is_some(), &app.jam.by);
 
         let count = queue.len().saturating_sub(start);
         if count == 0 {
@@ -951,16 +958,17 @@ pub fn queue_list(app: &mut App, ui: &mut Ui, salt: &str) {
                 return;
             }
             let t = &queue[i];
+            // The first row is the current song.
             let current = k == 0 && has_current;
             let o = widgets::RowOpts { current, added_by: by.get(&t.id).cloned(), ..rows.opts(liked, t, None, false) };
 
-            // Renderizar a linha normalmente (sem drop_zone)
             let resp = widgets::track_row(ui, t, &o, acts);
             if resp.clicked() {
+                // The playing row pauses/resumes instead of doing nothing.
                 acts.push(if current { Action::TogglePlay } else { Action::QueueJump(i) });
             }
 
-            // BOTÕES DE AÇÃO À DIREITA (▲, ▼, X, ⋮)
+            // Buttons to the right of the duration: remove, move, and the drag handle.
             if !current {
                 let btn_size = 28.0;
                 let btn_spacing = 4.0;
@@ -984,15 +992,13 @@ pub fn queue_list(app: &mut App, ui: &mut Ui, salt: &str) {
                     }
                 }
 
-                // Alça dedicada (☰) com Sense::drag()
+                // A dedicated handle (☰) that starts the drag.
                 let center = pos2(rx - btn_size / 2.0, resp.rect.center().y);
                 let handle_rect = Rect::from_center_size(center, Vec2::splat(btn_size));
                 let handle_resp = ui.allocate_rect(handle_rect, egui::Sense::drag());
 
-                // Desenho do glifo perfeitamente centrado (com +1.0 ou +1.5 no Y se necessário para compensar o baseline da fonte):
-                let text_pos = pos2(handle_rect.center().x, handle_rect.center().y + 1.0);
                 ui.painter().text(
-                    text_pos,
+                    pos2(handle_rect.center().x, handle_rect.center().y + 1.0),
                     egui::Align2::CENTER_CENTER,
                     "☰",
                     egui::FontId::proportional(13.0),
@@ -1010,7 +1016,7 @@ pub fn queue_list(app: &mut App, ui: &mut Ui, salt: &str) {
                 }
             }
 
-            // Feedback visual durante o Drag and Drop (animação/indicador)
+            // Where the dragged song is, and where it would land.
             let dragging_src: Option<usize> = ui.ctx().data(|d| d.get_temp(drag_source_id));
             if dragging_src == Some(i) {
                 ui.painter().rect_filled(resp.rect, 4.0, egui::Color32::from_white_alpha(20));
@@ -1021,14 +1027,13 @@ pub fn queue_list(app: &mut App, ui: &mut Ui, salt: &str) {
                 }
             }
 
-            // Detecção da soltura na linha de destino
+            // Releasing over a row drops the song there.
             if ui.input(|inp| inp.pointer.any_released()) {
                 let dragging_src: Option<usize> = ui.ctx().data(|d| d.get_temp(drag_source_id));
                 if let Some(from) = dragging_src {
                     if resp.rect.contains(ui.input(|inp| inp.pointer.interact_pos().unwrap_or_default())) {
-                        let to = i;
-                        if from != to {
-                            pending_move = Some((from, to));
+                        if from != i {
+                            pending_move = Some((from, i));
                         }
                     }
                 }
@@ -1041,11 +1046,7 @@ pub fn queue_list(app: &mut App, ui: &mut Ui, salt: &str) {
     }
 
     if let Some((from, to)) = pending_move {
-        let len = app.queue.len();
-        if from < len && to < len && from != to {
-            let item = app.queue.remove(from);
-            app.queue.insert(to, item);
-        }
+        app.queue.move_track(from, to);
     }
 }
 

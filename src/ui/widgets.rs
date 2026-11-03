@@ -12,11 +12,37 @@ pub fn named(resp: Response, name: &str) -> Response {
     resp
 }
 
-/// Single-line text truncated with an ellipsis to `width`.
+/// Single-line text truncated with an ellipsis to `width`. Right-to-left text is put in
+/// display order (`bidi`), and cut at its end (the left) when it doesn't fit.
 pub fn galley(ui: &Ui, text: &str, font: egui::FontId, color: Color32, width: f32) -> std::sync::Arc<egui::Galley> {
-    let mut job = egui::text::LayoutJob::simple_singleline(text.to_owned(), font, color);
-    job.wrap = egui::text::TextWrapping::truncate_at_width(width.max(10.0));
+    let width = width.max(10.0);
+    let mut job = if !crate::bidi::has_rtl(text) {
+        egui::text::LayoutJob::simple_singleline(text.to_owned(), font, color)
+    } else if crate::bidi::rtl_base(text) {
+        crate::bidi::job(&rtl_fit(ui, text, &font, width), font, color)
+    } else {
+        crate::bidi::job(text, font, color)
+    };
+    job.wrap = egui::text::TextWrapping::truncate_at_width(width);
     ui.fonts_mut(|f| f.layout_job(job))
+}
+
+/// Right-to-left `text`, shortened at its logical end with "…" until it fits `width`
+/// (egui would cut the right side, the start of the line).
+fn rtl_fit(ui: &Ui, text: &str, font: &egui::FontId, width: f32) -> String {
+    let fits = |s: &str| ui.fonts_mut(|f| f.layout_job(crate::bidi::job(s, font.clone(), Color32::WHITE)).size().x) <= width;
+    if fits(text) {
+        return text.to_owned();
+    }
+    let chars: Vec<(usize, char)> = text.char_indices().collect();
+    let cut = |n: usize| format!("{}…", text[..chars.get(n).map_or(text.len(), |c| c.0)].trim_end());
+    // The most characters that fit with the ellipsis.
+    let (mut lo, mut hi) = (0, chars.len());
+    while lo < hi {
+        let mid = (lo + hi).div_ceil(2);
+        if fits(&cut(mid)) { lo = mid } else { hi = mid - 1 }
+    }
+    cut(lo)
 }
 
 /// Wrapped text, at most `rows` lines.
@@ -28,10 +54,30 @@ pub fn galley_wrapped(
     width: f32,
     rows: usize,
 ) -> std::sync::Arc<egui::Galley> {
-    let mut job = egui::text::LayoutJob::simple(text.to_owned(), font, color, width.max(10.0));
+    let mut job = egui::text::LayoutJob::simple(text.to_owned(), font.clone(), color, width.max(10.0));
     job.wrap.max_rows = rows;
     job.wrap.break_anywhere = false;
     job.wrap.overflow_character = Some('…');
+    let g = ui.fonts_mut(|f| f.layout_job(job.clone()));
+    if !crate::bidi::has_rtl(text) {
+        return g;
+    }
+    // Wrapped in reading order, then each row put in display order on its own (ordering
+    // the whole text first would start the first row with the end of the sentence).
+    let mut rows_text = Vec::with_capacity(g.rows.len());
+    let mut chars = text.chars();
+    for (i, row) in g.rows.iter().enumerate() {
+        let mut s: String = chars.by_ref().take(row.char_count_including_newline().0).collect();
+        if s.ends_with('\n') {
+            s.pop();
+        }
+        if i + 1 == g.rows.len() && g.elided {
+            s = format!("{}…", s.trim_end());
+        }
+        rows_text.push(s.trim_end().to_owned());
+    }
+    let mut job = crate::bidi::job(&rows_text.join("\n"), font, color);
+    job.halign = g.job.halign;
     ui.fonts_mut(|f| f.layout_job(job))
 }
 
@@ -44,6 +90,7 @@ pub fn text_at(ui: &Ui, pos: Pos2, text: &str, font: egui::FontId, color: Color3
 
 /// Single-line text whose artist names are links: underlined on hover, and a click
 /// opens the artist's page. Names without a channel id stay plain text.
+#[allow(clippy::too_many_arguments)]
 pub fn linked_text(
     ui: &Ui,
     pos: Pos2,
@@ -56,15 +103,21 @@ pub fn linked_text(
 ) -> Rect {
     let g = galley(ui, text, font, color, width);
     let rect = Rect::from_min_size(pos, g.size());
+    // Names are found in the text as shown: right-to-left text is reordered, its names
+    // with it, and they no longer come in reading order.
+    let shown = g.job.text.clone();
+    let rtl = crate::bidi::has_rtl(text);
     let mut search_from = 0;
     for (i, l) in links.iter().enumerate() {
         let Some(id) = &l.id else { continue };
-        let Some(off) = text[search_from..].find(l.name.as_str()) else { continue };
-        let start = search_from + off;
-        let end = start + l.name.len();
+        let name = crate::bidi::visual(&l.name);
+        let from = if rtl { 0 } else { search_from };
+        let Some(off) = shown[from..].find(name.as_ref()) else { continue };
+        let start = from + off;
+        let end = start + name.len();
         search_from = end;
-        let c0 = text[..start].chars().count();
-        let c1 = text[..end].chars().count();
+        let c0 = shown[..start].chars().count();
+        let c1 = shown[..end].chars().count();
         let x0 = g.pos_from_cursor(egui::text::CCursor::new(c0)).min.x;
         let x1 = g.pos_from_cursor(egui::text::CCursor::new(c1)).min.x;
         if x1 - x0 < 2.0 {
@@ -476,10 +529,10 @@ pub fn song_actions(ui: &mut Ui, t: &Track, liked: bool, remove: Option<usize>, 
     if menu_action(ui, Some(icon::LIST_PLUS), "Add to playlist") {
         acts.push(Action::AddToPlaylist(vec![t.clone()]));
     }
-    if let Some(i) = remove {
-        if menu_action(ui, Some(icon::LIST_MINUS), "Remove from playlist") {
-            acts.push(Action::RemoveFromPlaylist(vec![i]));
-        }
+    if let Some(i) = remove
+        && menu_action(ui, Some(icon::LIST_MINUS), "Remove from playlist")
+    {
+        acts.push(Action::RemoveFromPlaylist(vec![i]));
     }
     if menu_action(ui, None, "Copy link") {
         acts.push(Action::Share(Target::Song(t.clone())));
@@ -509,16 +562,15 @@ pub fn song_actions(ui: &mut Ui, t: &Track, liked: bool, remove: Option<usize>, 
     if t.album.as_ref().and_then(|a| a.id.as_ref()).is_some() || t.first_artist_id().is_some() {
         ui.separator();
     }
-    if let Some(id) = t.album.as_ref().and_then(|a| a.id.clone()) {
-        if menu_action(ui, Some(icon::DISC_3), "Go to album") {
-            acts.push(Action::Open(Target::Album(id)));
-        }
+    if let Some(id) = t.album.as_ref().and_then(|a| a.id.clone())
+        && menu_action(ui, Some(icon::DISC_3), "Go to album")
+    {
+        acts.push(Action::Open(Target::Album(id)));
     }
-    if let Some(id) = t.first_artist_id() {
-        if menu_action(ui, Some(icon::USER), "Go to artist") {
+    if let Some(id) = t.first_artist_id()
+        && menu_action(ui, Some(icon::USER), "Go to artist") {
             acts.push(Action::Open(Target::Artist(id.to_owned())));
         }
-    }
 }
 
 /// Soft drop shadow under a rounded rect (e.g. artwork).
@@ -891,32 +943,6 @@ pub fn h_scroll<R>(ui: &mut Ui, id: &str, nudge: i32, count: usize, item_width: 
     (out.inner, reached_end)
 }
 
-#[cfg(test)]
-mod shelf_scroll_tests {
-    use super::{shelf_page_starts, shelf_page_target};
-
-    #[test]
-    fn arrows_visit_aligned_pages_in_both_directions() {
-        let pages = shelf_page_starts(14, 5);
-        assert_eq!(pages, [0, 5, 9]);
-        let mut target = 0.0;
-        for direction in [1, 1, -1] {
-            target = shelf_page_target(&pages, 198.0, target, direction);
-        }
-        assert_eq!(target, 5.0 * 198.0);
-        assert_eq!(shelf_page_target(&pages, 198.0, 0.0, -1), 0.0);
-    }
-
-    #[test]
-    fn short_final_page_is_filled_without_overscrolling() {
-        assert_eq!(shelf_page_starts(4, 3), [0, 1]);
-        assert_eq!(shelf_page_starts(3, 3), [0]);
-        assert_eq!(shelf_page_starts(1, 3), [0]);
-        // The old last page is between new page starts after more picks arrive.
-        assert_eq!(shelf_page_target(&shelf_page_starts(11, 3), 436.0, 2.0 * 436.0, 1), 3.0 * 436.0);
-    }
-}
-
 /// The skeleton's light band sweeping across `r`, for anything still loading.
 pub fn shimmer_band(ui: &Ui, r: Rect, radius: f32, time: f64) {
     let phase = ((time * 0.8) % 1.6) as f32 - 0.3;
@@ -1004,5 +1030,31 @@ pub fn skeleton(ui: &mut Ui, time: f64, rows: usize, card: f32) {
     // The shimmer needs frames only while it's on screen, and 15 fps is plenty.
     if ui.is_rect_visible(Rect::from_x_y_ranges(ui.max_rect().x_range(), top..=ui.cursor().top())) {
         ui.ctx().request_repaint_after(std::time::Duration::from_millis(66));
+    }
+}
+
+#[cfg(test)]
+mod shelf_scroll_tests {
+    use super::{shelf_page_starts, shelf_page_target};
+
+    #[test]
+    fn arrows_visit_aligned_pages_in_both_directions() {
+        let pages = shelf_page_starts(14, 5);
+        assert_eq!(pages, [0, 5, 9]);
+        let mut target = 0.0;
+        for direction in [1, 1, -1] {
+            target = shelf_page_target(&pages, 198.0, target, direction);
+        }
+        assert_eq!(target, 5.0 * 198.0);
+        assert_eq!(shelf_page_target(&pages, 198.0, 0.0, -1), 0.0);
+    }
+
+    #[test]
+    fn short_final_page_is_filled_without_overscrolling() {
+        assert_eq!(shelf_page_starts(4, 3), [0, 1]);
+        assert_eq!(shelf_page_starts(3, 3), [0]);
+        assert_eq!(shelf_page_starts(1, 3), [0]);
+        // The old last page is between new page starts after more picks arrive.
+        assert_eq!(shelf_page_target(&shelf_page_starts(11, 3), 436.0, 2.0 * 436.0, 1), 3.0 * 436.0);
     }
 }

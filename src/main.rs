@@ -3,17 +3,17 @@
 mod appicon;
 mod fullscreen;
 mod proxy;
+mod renderer;
 mod art;
 mod audio;
 mod backend;
+mod bidi;
+mod config;
 mod deeplink;
 mod discord;
-mod config;
-
 mod downloads;
-mod images;
 mod hotkeys;
-
+mod images;
 mod jam;
 mod innertube;
 mod jsc;
@@ -22,6 +22,7 @@ mod login;
 mod lyrics;
 mod media;
 mod model;
+mod opus;
 mod preset;
 mod shader;
 mod sponsorblock;
@@ -80,6 +81,8 @@ fn main() -> eframe::Result {
             return Ok(());
         }
         deeplink::push(code);
+    } else if deeplink::forward_show() {
+        return Ok(());
     }
     init_logging();
     update::clean_portable();
@@ -94,12 +97,19 @@ fn main() -> eframe::Result {
         .with_app_id("ytm-rs")
         .with_inner_size(DEFAULT_SIZE)
         .with_min_inner_size(MIN_SIZE)
+        // Windows: the app draws its own title bar (see `ui::titlebar`).
+        .with_decorations(!ui::custom_titlebar())
         .with_icon(appicon::get(appicon::load(&data_dir())).icon_data().expect("bundled icons are valid PNGs"));
     if background {
         viewport = viewport.with_position([-4000.0, 0.0]).with_inner_size([1920.0, 1057.0]).with_active(false).with_taskbar(false);
     }
+    let renderer = renderer::init(&data_dir());
     let options = eframe::NativeOptions {
         viewport,
+        renderer: match renderer {
+            renderer::Renderer::OpenGl => eframe::Renderer::Glow,
+            renderer::Renderer::Wgpu => eframe::Renderer::Wgpu,
+        },
         persist_window: !background,
         // Settings live with the rest of the data: beside the portable exe, or a
         // YTM_DATA_DIR profile (e.g. a clean signed-out one for screenshots).
@@ -110,10 +120,11 @@ fn main() -> eframe::Result {
         stencil_buffer: 0,
         // Dev hook: YTM_FPS paces frames itself (see `dev_pace`), so vsync is off.
         glow_options: eframe::egui_glow::GlowConfiguration { vsync: std::env::var_os("YTM_FPS").is_none(), ..Default::default() },
+        wgpu_options: renderer::wgpu_options(),
         ..Default::default()
     };
 
-    eframe::run_native(
+    let run = eframe::run_native(
         "ytm-rs",
         options,
         Box::new(|cc| {
@@ -129,6 +140,7 @@ fn main() -> eframe::Result {
                     c.request_repaint();
                 }
             };
+
             // A shortcut press has to wake the UI itself: while the window is
             // minimized or hidden egui draws no frames, so nothing would poll it.
             hotkeys::install_wake(wake);
@@ -183,11 +195,18 @@ fn main() -> eframe::Result {
                 let (renderer, version) = unsafe { (gl.get_parameter_string(eframe::glow::RENDERER), gl.get_parameter_string(eframe::glow::VERSION)) };
                 log::info!("gl: {renderer} ({version})");
             }
-            // The animated background needs the GL context; without it the UI falls back
+            if let Some(rs) = &cc.wgpu_render_state {
+                let info = rs.adapter.get_info();
+                log::info!("wgpu: {} ({:?}, driver {} {})", info.name, info.backend, info.driver, info.driver_info);
+            }
+            // The animated background needs the GPU context; without it the UI falls back
             // to a flat gradient.
-            let bg = cc.gl.as_ref().filter(|_| std::env::var_os("YTM_NO_SHADER").is_none()).and_then(|gl| {
-                shader::Background::new(gl).map_err(|e| log::warn!("background shader unavailable: {e:#}")).ok()
-            });
+            let shader = std::env::var_os("YTM_NO_SHADER").is_none();
+            let bg = match (&cc.gl, &cc.wgpu_render_state) {
+                (Some(gl), _) if shader => shader::Background::new(gl).map_err(|e| log::warn!("background shader unavailable: {e:#}")).ok(),
+                (_, Some(rs)) if shader => Some(shader::Background::new_wgpu(rs)),
+                _ => None,
+            };
 
             Ok(Box::new(ui::App::new(
                 backend,
@@ -198,7 +217,14 @@ fn main() -> eframe::Result {
                 cc.storage,
             )))
         }),
-    )
+    );
+    // A wgpu window that won't open would fail the same way at every launch: go back
+    // to OpenGL for the next one.
+    if run.is_err() && renderer == renderer::Renderer::Wgpu {
+        log::error!("renderer: {} failed to start; switching back to OpenGL", renderer::api_name());
+        let _ = renderer::save(&data_dir(), renderer::Renderer::OpenGl);
+    }
+    run
 }
 
 #[cfg(windows)]
@@ -219,7 +245,8 @@ fn hwnd(_: &eframe::CreationContext) -> Option<*mut std::ffi::c_void> {
 /// next to the settings (overwritten each launch).
 fn init_logging() {
     let mut builder = env_logger::Builder::from_env(
-        env_logger::Env::default().default_filter_or("warn,ytm_rs=info"),
+        // A test build can be made more talkative: YTM_DEFAULT_LOG=warn,ytm_rs=debug cargo build.
+        env_logger::Env::default().default_filter_or(option_env!("YTM_DEFAULT_LOG").unwrap_or("warn,ytm_rs=info")),
     );
     // Dev hook: YTM_LOG=<path> logs there (test runs beside a running copy).
     if let Some(path) = std::env::var_os("YTM_LOG") {
@@ -229,6 +256,8 @@ fn init_logging() {
     } else if !cfg!(debug_assertions) {
         let dir = data_dir();
         let _ = std::fs::create_dir_all(&dir);
+        // The last run's log too: reopening the app after a problem would otherwise wipe it.
+        let _ = std::fs::rename(dir.join("ytm-rs.log"), dir.join("ytm-rs.prev.log"));
         if let Ok(file) = std::fs::File::create(dir.join("ytm-rs.log")) {
             builder.target(env_logger::Target::Pipe(Box::new(file)));
         }

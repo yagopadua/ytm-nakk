@@ -278,7 +278,7 @@ impl Updater {
             while let Some(chunk) = resp.chunk().await? {
                 std::io::Write::write_all(&mut file, &chunk)?;
                 got += chunk.len() as u64;
-                let percent = if size > 0 { (got * 100 / size).min(100) as u8 } else { 0 };
+                let percent = (got * 100).checked_div(size).map_or(0, |p| p.min(100) as u8);
                 if percent != shown {
                     shown = percent;
                     self.set(State::Downloading { version: version.clone(), percent });
@@ -343,7 +343,7 @@ impl Updater {
             installer.display()
         );
         if relaunch {
-            script += &format!(" & start \"\" \"{}\"", exe.display());
+            script += &format!(" & start \"\" \"{}\" {}", exe.display(), crate::deeplink::RELAUNCH_FLAG);
         }
         if std::env::var_os("YTM_UPDATE_DRYRUN").is_some() {
             log::info!("update (dry run): cmd /C {script}");
@@ -375,7 +375,7 @@ fn swap_exe(new: &Path, exe: &Path, relaunch: bool) {
     log::info!("update: replaced {}", exe.display());
     if relaunch {
         // Once this process has saved and exited.
-        run_detached(&format!("ping -n 3 127.0.0.1 >NUL & start \"\" \"{}\"", exe.display()));
+        run_detached(&format!("ping -n 3 127.0.0.1 >NUL & start \"\" \"{}\" {}", exe.display(), crate::deeplink::RELAUNCH_FLAG));
     }
 }
 
