@@ -13,6 +13,7 @@ mod jam;
 mod karaoke;
 mod lists;
 mod lyric_prefs;
+mod mini;
 mod notes;
 mod nowplaying;
 mod pages;
@@ -21,7 +22,7 @@ mod queue;
 mod responses;
 mod shell;
 mod titlebar;
-pub use titlebar::custom as custom_titlebar;
+pub use titlebar::{custom as custom_titlebar, set_hwnd as set_titlebar_hwnd};
 mod transfer;
 mod widgets;
 
@@ -70,6 +71,8 @@ pub enum LibTab {
     Albums,
     History,
     Uploads,
+    /// Songs saved on this computer: played from their files, so offline and signed out too.
+    Downloads,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -112,6 +115,8 @@ pub enum Action {
     /// Reload the home feed, so it suggests different music.
     RefreshHome,
     OpenNowPlaying(bool),
+    /// Into the mini player (true) or back to the full window.
+    Mini(bool),
     /// Play/pause what's already loaded (a card's button on the playing item).
     TogglePlay,
     /// A song chosen on the search page as the Spotify transfer's match.
@@ -256,6 +261,8 @@ pub struct App {
     library_requested: std::time::Instant,
     history: Option<Vec<Track>>,
     uploads: Option<Vec<Track>>,
+    /// Library › Downloads, read from the download index when the tab opens.
+    downloads: Option<Vec<Track>>,
     /// Files chosen in the upload dialog, handed over from its thread.
     picked_uploads: Arc<std::sync::Mutex<Option<Vec<std::path::PathBuf>>>>,
     liked: HashSet<String>,
@@ -264,6 +271,12 @@ pub struct App {
     selection: Selection,
     account_name: Option<String>,
     account_avatar: Option<String>,
+    /// The signed-in account's channels and which one is used, once Settings asked.
+    channels: Option<crate::backend::Channels>,
+    /// When they were last asked for (`ui.input` time).
+    channels_asked: Option<f64>,
+    /// The channel being switched to, named for the toast once it's done.
+    switching_to: Option<String>,
     /// Last launch's playlists, shown in the sidebar until the library arrives.
     sidebar_cache: Option<Vec<Card>>,
 
@@ -281,6 +294,10 @@ pub struct App {
     normalize: bool,
     log_volume: bool,
     high_quality: bool,
+    /// Play an official music video as its song version when one is found.
+    play_songs: bool,
+    /// The song version playing in place of the current music video.
+    playing_as: Option<PlayingAs>,
     /// The output device picked in settings (cpal's id and its name, for when it's not
     /// connected), and the devices last listed there.
     output_device: Option<(String, String)>,
@@ -297,6 +314,8 @@ pub struct App {
     theme_id: String,
     /// Preset whose chrome (glass, corner radius) is installed in the egui style.
     chrome_applied: Option<String>,
+    /// Light or dark pages (the ytm-rs theme's; see `light_pages`).
+    appearance: theme::Appearance,
     anim_bg: bool,
     reactive_bg: bool,
     /// Skip the parts of music videos SponsorBlock marks as not music.
@@ -339,6 +358,8 @@ pub struct App {
     np_tab: NpTab,
     queue_open: bool,
     fullscreen: bool,
+    /// The mini player: the window shrunk to a strip.
+    mini: mini::Mini,
     /// Every source's lyrics for the current song (by video ID).
     lyrics: Option<(String, LyricsSet)>,
     /// Romanization/translation for one source's lines: (video ID, source key, language, extras).
@@ -605,12 +626,16 @@ impl App {
             library_requested: std::time::Instant::now(),
             history: None,
             uploads: None,
+            downloads: None,
             picked_uploads: Default::default(),
             liked: HashSet::new(),
             unliking: HashMap::new(),
             selection: Selection::default(),
             account_name: None,
             account_avatar: None,
+            channels: None,
+            channels_asked: None,
+            switching_to: None,
             sidebar_cache: None,
             queue: Queue::new(match get("repeat").as_deref() {
                 Some("all") => Repeat::All,
@@ -625,6 +650,8 @@ impl App {
             normalize: get("normalize").is_none_or(|v| v == "1"),
             log_volume: get("log_volume").is_none_or(|v| v == "1"),
             high_quality: get("high_quality").is_none_or(|v| v == "1"),
+            play_songs: get("play_songs").is_none_or(|v| v == "1"),
+            playing_as: None,
             output_device: get("output_device").filter(|d| !d.is_empty()).map(|id| (id, get("output_device_name").unwrap_or_default())),
             output_devices: Vec::new(),
             updater: None,
@@ -667,6 +694,8 @@ impl App {
             // Dev hook: YTM_THEME=<preset id> tries a theme without saving it.
             theme_id: std::env::var("YTM_THEME").ok().or_else(|| get("theme")).unwrap_or_else(|| crate::preset::DEFAULT_ID.to_owned()),
             chrome_applied: None,
+            // Dev hook: YTM_APPEARANCE=light|dark|system tries a mode without saving it.
+            appearance: theme::Appearance::from_key(&dev_var("YTM_APPEARANCE").map(str::to_owned).or_else(|| get("appearance")).unwrap_or_default()),
             anim_bg: get("anim_bg").is_none_or(|v| v == "1"),
             reactive_bg: get("reactive_bg").is_none_or(|v| v == "1"),
             sponsorblock: get("sponsorblock").is_some_and(|v| v == "1"),
@@ -689,6 +718,7 @@ impl App {
             np_tab: if get("np_art").is_some_and(|v| v == "1") { NpTab::Art } else { NpTab::Lyrics },
             queue_open: false,
             fullscreen: false,
+            mini: mini::Mini::load(get),
             lyrics: None,
             lyrics_extras: None,
             extras_asked: None,
@@ -719,7 +749,7 @@ impl App {
         let smoke = std::env::var("YTM_SMOKE").ok().filter(|q| !q.is_empty());
         if let Some(ids) = smoke.as_deref().and_then(|q| q.strip_prefix("id:")) {
             // "id:a,b,c" queues several.
-            let track = |id: &str| Track { id: id.to_owned(), title: id.to_owned(), artists: vec![], album: None, duration: None, thumbs: vec![], track_nr: None, plays: None };
+            let track = |id: &str| Track { id: id.to_owned(), title: id.to_owned(), artists: vec![], album: None, duration: None, thumbs: vec![], track_nr: None, plays: None, music_video: false };
             app.play_list(ids.split(',').map(track).collect(), 0);
         } else if let Some(q) = smoke {
             app.go(Page::Search(q.clone()));
@@ -734,6 +764,7 @@ impl App {
             Ok("uploads") => app.go(Page::Library(LibTab::Uploads)),
             Ok("liked") => app.go(Page::Library(LibTab::Songs)),
             Ok("history") => app.go(Page::Library(LibTab::History)),
+            Ok("downloads") => app.go(Page::Library(LibTab::Downloads)),
             Ok("settings") => app.go(Page::Settings),
             Ok("transfer") => app.go(Page::Transfer),
             Ok("jam") => app.go(Page::Jam),
@@ -852,6 +883,11 @@ impl App {
                 }
                 None
             }
+            // On this computer: no request, and the files are read again on each visit.
+            Page::Library(LibTab::Downloads) => {
+                self.downloads = Some(crate::downloads::all());
+                None
+            }
             Page::Library(_) if self.logged_in => Some(Req::Library),
             _ => None,
         };
@@ -864,6 +900,7 @@ impl App {
             Page::Library(LibTab::History) => self.history.is_some(),
             Page::Library(LibTab::Uploads) => self.uploads.is_some(),
             Page::Library(LibTab::Songs) => self.opened(LIKED_MUSIC).is_some(),
+            Page::Library(LibTab::Downloads) => true,
             Page::Library(_) => self.library.is_some(),
             _ => false,
         };
@@ -887,7 +924,21 @@ impl App {
     }
 
     fn accent_color(&self) -> Color32 {
-        if self.default_theme { theme::RED } else { self.look().accent(self.accent) }
+        let c = if self.default_theme { theme::RED } else { self.look().accent(self.accent) };
+        if theme::light() {
+            // A pale cover colour would barely show on light pages: deepen it.
+            let luma = 0.299 * c.r() as f32 + 0.587 * c.g() as f32 + 0.114 * c.b() as f32;
+            if luma > 150.0 {
+                return theme::lerp_color(c, Color32::BLACK, ((luma - 150.0) / 105.0 * 0.45).min(0.45));
+            }
+        }
+        c
+    }
+
+    /// Whether pages draw light: only the ytm-rs theme has a light mode, and it follows
+    /// Settings › Appearance › Mode.
+    fn light_pages(&self, ctx: &egui::Context) -> bool {
+        !self.default_theme && self.look().id == crate::preset::DEFAULT_ID && self.appearance.is_light(ctx)
     }
 
     /// The active theme preset; the classic red theme uses the built-in look's layout.
@@ -996,7 +1047,7 @@ impl App {
                     .inner_margin(egui::Margin { left: 26, right: 26, top: 24, bottom: 22 })
                     .show(ui, |ui| {
                         ui.spacing_mut().item_spacing = egui::vec2(0.0, 0.0);
-                        ui.label(egui::RichText::new("Keyboard shortcuts").font(theme::bold(22.0)).color(theme::TEXT));
+                        ui.label(egui::RichText::new("Keyboard shortcuts").font(theme::bold(22.0)).color(theme::text()));
                         ui.add_space(6.0);
                         match self.hotkey_action_to_edit {
                             Some(cmd) => {
@@ -1010,7 +1061,7 @@ impl App {
                                 ui.label(
                                     egui::RichText::new(if combo.is_empty() { "Waiting for a key".to_owned() } else { format!("{combo} + …") })
                                         .font(theme::semibold(17.0))
-                                        .color(theme::TEXT),
+                                        .color(theme::text()),
                                 );
                                 if let Some(error) = &self.hotkey_error {
                                     ui.add_space(10.0);
@@ -1047,19 +1098,19 @@ impl App {
                                         }
                                     });
                                 }
-                                if let Some(hotkeys) = &self.hotkeys {
-                                    if !hotkeys.failed().is_empty() {
-                                        let names: Vec<&str> = hotkeys.failed().iter().map(|cmd| cmd.label()).collect();
-                                        ui.add_space(10.0);
-                                        ui.label(
-                                            egui::RichText::new(format!(
-                                                "The system wouldn't give ytm-rs the shortcut for {}. Another app may be using it.",
-                                                names.join(", ").to_lowercase()
-                                            ))
-                                            .font(theme::regular(12.5))
-                                            .color(theme::RED),
-                                        );
-                                    }
+                                if let Some(hotkeys) = &self.hotkeys
+                                    && !hotkeys.failed().is_empty()
+                                {
+                                    let names: Vec<&str> = hotkeys.failed().iter().map(|cmd| cmd.label()).collect();
+                                    ui.add_space(10.0);
+                                    ui.label(
+                                        egui::RichText::new(format!(
+                                            "The system wouldn't give ytm-rs the shortcut for {}. Another app may be using it.",
+                                            names.join(", ").to_lowercase()
+                                        ))
+                                        .font(theme::regular(12.5))
+                                        .color(theme::RED),
+                                    );
                                 }
                                 ui.add_space(14.0);
                                 done = widgets::pill(ui, "Done", None, true).clicked();
@@ -1091,20 +1142,20 @@ impl eframe::App for App {
         self.sync_look();
         self.pump(now);
         self.skip_segments(ctx, now);
-        if let Some(hk) = &self.hotkeys {
-            if let Some(cmd) = hk.poll() {
-                match cmd {
-                    crate::hotkeys::HotkeyCmd::TogglePlay => self.toggle(),
-                    crate::hotkeys::HotkeyCmd::Next => self.next(),
-                    crate::hotkeys::HotkeyCmd::Prev => self.prev(),
-                    crate::hotkeys::HotkeyCmd::VolumeUp => {
-                        let v = (self.audio.volume() + 0.05).clamp(0.0, 1.0);
-                        self.audio.set_volume(v);
-                    }
-                    crate::hotkeys::HotkeyCmd::VolumeDown => {
-                        let v = (self.audio.volume() - 0.05).clamp(0.0, 1.0);
-                        self.audio.set_volume(v);
-                    }
+        if let Some(hk) = &self.hotkeys
+            && let Some(cmd) = hk.poll()
+        {
+            match cmd {
+                crate::hotkeys::HotkeyCmd::TogglePlay => self.toggle(),
+                crate::hotkeys::HotkeyCmd::Next => self.next(),
+                crate::hotkeys::HotkeyCmd::Prev => self.prev(),
+                crate::hotkeys::HotkeyCmd::VolumeUp => {
+                    let v = (self.audio.volume() + 0.05).clamp(0.0, 1.0);
+                    self.audio.set_volume(v);
+                }
+                crate::hotkeys::HotkeyCmd::VolumeDown => {
+                    let v = (self.audio.volume() - 0.05).clamp(0.0, 1.0);
+                    self.audio.set_volume(v);
                 }
             }
         }
@@ -1151,6 +1202,25 @@ impl eframe::App for App {
             }
         }
         fit_window_to_monitor(ctx);
+        // Dev hook: YTM_MINI=<secs>[,<secs>…] switches between the mini player and the
+        // full window at those times (YTM_MINI=1: the mini player after a second).
+        if let Some(v) = dev_var("YTM_MINI") {
+            let times: Vec<f64> = v.split(',').filter_map(|t| t.parse().ok()).collect();
+            let id = egui::Id::unique("dev-mini");
+            let done: usize = ctx.data(|d| d.get_temp(id)).unwrap_or(0);
+            if let Some(&t) = times.get(done) {
+                if now >= t {
+                    ctx.data_mut(|d| d.insert_temp(id, done + 1));
+                    self.mini.request(done.is_multiple_of(2));
+                } else {
+                    ctx.request_repaint_after(Duration::from_secs_f64((t - now).min(0.2)));
+                }
+            }
+        }
+        if let Some(on) = self.mini.take_request() {
+            self.set_mini(ctx, on, now);
+        }
+        self.mini.tick(ctx, now);
         self.tray_window(ctx);
         self.window_hidden = self.tray.is_some() || ctx.input(|i| i.viewport().minimized == Some(true));
         self.sync_discord();
@@ -1185,7 +1255,7 @@ impl eframe::App for App {
             if playing || self.buffering {
                 ctx.request_repaint_after(Duration::from_millis(250));
             }
-        } else if self.np_open && playing {
+        } else if self.np_open && playing && !self.mini.busy() {
             ctx.request_repaint_after(Duration::from_millis(33));
         } else if playing && widgets::equalizer_shown(ctx) {
             // The playing row's bars need a steady, full rate to read as smooth.
@@ -1205,8 +1275,10 @@ impl eframe::App for App {
 
         self.sync_look();
         let look = self.look();
-        let accent = self.accent_color();
-        ctx.data_mut(|d| d.insert_temp(egui::Id::unique("accent"), accent));
+        // Now playing is dark; once it's most of the way up, so is the player bar under it.
+        let np = theme::anim_bool(&ctx, "np-open", self.np_open && self.current().is_some(), 0.42);
+        let light = self.light_pages(&ctx) && np < 0.5 && !self.fullscreen;
+        theme::set_mode(&ctx, light);
         if self.chrome_applied.as_deref() != Some(look.id.as_str()) {
             if self.chrome_applied.is_none() {
                 ctx.add_texture_loader(Arc::new(crate::images::Textures::default()));
@@ -1214,12 +1286,28 @@ impl eframe::App for App {
             theme::apply_chrome(&ctx, look);
             self.chrome_applied = Some(look.id.clone());
         }
+        let accent = self.accent_color();
+        ctx.data_mut(|d| d.insert_temp(egui::Id::unique("accent"), accent));
         let app_style = &look.app;
         // Once now playing has slid all the way up it hides everything but the player
         // bar, so the pages and the full-screen background under it aren't drawn.
-        let covered = !self.fullscreen && theme::anim_bool(&ctx, "np-open", self.np_open && self.current().is_some(), 0.42) >= 1.0;
+        let covered = !self.fullscreen && np >= 1.0;
         let bar_strip = egui::Rect::from_min_max(egui::pos2(screen.left(), screen.bottom() - self.bar_height()), screen.max);
         titlebar::set_fullscreen(&ctx, self.fullscreen);
+        // The mini player, or nothing but the background while the window changes size.
+        let layout = self.mini.layout(&ctx);
+        if layout != mini::Layout::Full {
+            shell::background(self, ui, screen, now, None);
+            if layout == mini::Layout::Mini {
+                mini::strip(self, ui, now);
+                titlebar::resize_sides(&ctx);
+                // "Sign in to like songs" and such: shown here too, not timed out unseen.
+                shell::toast(self, &ctx, now);
+                self.mini.fade_in(&ctx, now, shell::base_color(self));
+            }
+            dev_screenshot(&ctx, now);
+            return;
+        }
         shell::background(self, ui, screen, now, covered.then_some(bar_strip));
         if !self.fullscreen && !covered {
             // The top of the window, down to the search box's row: what's on it comes after.
@@ -1231,7 +1319,7 @@ impl eframe::App for App {
             let frame = if floating {
                 egui::Frame::new().inner_margin(egui::Margin { left: 14, right: 14, top: 0, bottom: 14 })
             } else {
-                let mut f = egui::Frame::new().fill(theme::shade(bar_alpha));
+                let mut f = egui::Frame::new().fill(theme::panel(bar_alpha));
                 if app_style.bar_border {
                     f = f.stroke(egui::Stroke::new(1.0, theme::glass(0.1)));
                 }
@@ -1246,7 +1334,7 @@ impl eframe::App for App {
                         let r = ui.max_rect();
                         let radius = look.chrome.radius.clamp(10.0, 26.0);
                         widgets::soft_shadow(ui, r, radius, 24.0, 0.45);
-                        ui.painter().rect_filled(r, radius, theme::shade((bar_alpha + 0.07).min(1.0)));
+                        ui.painter().rect_filled(r, radius, theme::panel((bar_alpha + 0.07).min(1.0)));
                         let edge = if app_style.bar_border { 0.14 } else { 0.08 };
                         ui.painter().rect_stroke(r, radius, egui::Stroke::new(1.0, theme::glass(edge)), egui::StrokeKind::Inside);
                         ui.set_clip_rect(r);
@@ -1260,11 +1348,11 @@ impl eframe::App for App {
             // The logo's row is 32 points tall.
             let side_margin = egui::Margin { left: 14, right: 14, top: titlebar::top_margin(16, 32.0), bottom: 16 };
             let side_frame = match app_style.sidebar {
-                SidebarStyle::Glass => egui::Frame::new().fill(theme::shade(side_alpha)).inner_margin(side_margin),
+                SidebarStyle::Glass => egui::Frame::new().fill(theme::panel(side_alpha)).inner_margin(side_margin),
                 SidebarStyle::Transparent => egui::Frame::new().inner_margin(side_margin),
                 SidebarStyle::Solid => egui::Frame::new().fill(look.solid()).inner_margin(side_margin),
                 SidebarStyle::Floating => egui::Frame::new()
-                    .fill(theme::shade(side_alpha.max(0.3)))
+                    .fill(theme::panel(side_alpha.max(0.3)))
                     .stroke(egui::Stroke::new(1.0, theme::glass(0.08)))
                     .corner_radius(egui::CornerRadius::same(theme::panel_radius().max(12)))
                     .outer_margin(egui::Margin { left: 10, right: 4, top: 10, bottom: 10 })
@@ -1279,7 +1367,7 @@ impl eframe::App for App {
             if q > 0.01 {
                 egui::Panel::right("queue").resizable(false)
                     .exact_size(340.0 * q)
-                    .frame(egui::Frame::new().fill(theme::shade(0.42)).inner_margin(egui::Margin::symmetric(14, 16)))
+                    .frame(egui::Frame::new().fill(theme::panel(0.42)).inner_margin(egui::Margin::symmetric(14, 16)))
                     .show_separator_line(false)
                     .show(ui, |ui| shell::queue_drawer(self, ui));
             }
@@ -1291,7 +1379,11 @@ impl eframe::App for App {
                     pages::page(self, ui, now);
                 });
         }
-        nowplaying::overlay(self, &ctx, now);
+        if np > 0.001 {
+            let pages = theme::set_mode(&ctx, false);
+            nowplaying::overlay(self, &ctx, now);
+            theme::set_mode(&ctx, pages);
+        }
         self.draw_dialog(&ctx);
         self.draw_hotkey_modal(&ctx);
         notes::card(self, &ctx);
@@ -1302,6 +1394,8 @@ impl eframe::App for App {
 
         titlebar::window_buttons(&ctx);
         titlebar::resize_edges(&ctx);
+        // Back from the mini player.
+        self.mini.fade_in(&ctx, now, shell::base_color(self));
 
         if dev_var("YTM_THEME_TOUR").is_some() {
             self.theme_tour(&ctx, now);
@@ -1365,6 +1459,7 @@ impl eframe::App for App {
         storage.set_string("normalize", b(self.normalize));
         storage.set_string("log_volume", b(self.log_volume));
         storage.set_string("high_quality", b(self.high_quality));
+        storage.set_string("play_songs", b(self.play_songs));
         let folder = crate::downloads::folder();
         storage.set_string("download_dir", if folder == crate::downloads::default_folder() { String::new() } else { folder.display().to_string() });
         let (device, device_name) = self.output_device.clone().unzip();
@@ -1380,6 +1475,12 @@ impl eframe::App for App {
         } else {
             self.good_window = storage.get_string("window");
         }
+        // In the mini player, the full window's place is the one to reopen at.
+        self.mini.save(storage);
+        if let Some(w) = self.mini.full_window() {
+            storage.set_string("window", w.clone());
+            self.good_window = Some(w);
+        }
         storage.set_string("close_to_tray", b(self.close_to_tray));
         storage.set_string("sidebar_collapsed", b(self.sidebar_collapsed));
         // Pretend versions (dev hook) mustn't decide the real "what's new".
@@ -1388,6 +1489,9 @@ impl eframe::App for App {
         }
         storage.set_string("discord_enabled", b(self.discord_enabled));
         storage.set_string("default_theme", b(self.default_theme));
+        if dev_var("YTM_APPEARANCE").is_none() {
+            storage.set_string("appearance", self.appearance.key().to_owned());
+        }
         if std::env::var_os("YTM_THEME").is_none() {
             storage.set_string("theme", self.theme_id.clone());
         }
@@ -1469,6 +1573,16 @@ struct Session {
     duration_ms: u64,
     #[serde(default)]
     listened_at: u64,
+    /// The song version that was playing for the current music video: the position is its.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    playing_as: Option<Track>,
+}
+
+/// The song version playing in place of the music video `listed`, in play `generation`.
+struct PlayingAs {
+    generation: u64,
+    listed: String,
+    song: Track,
 }
 
 
@@ -1579,4 +1693,23 @@ fn updatable() -> bool {
 
 pub fn fmt_time(secs: u32) -> String {
     format!("{}:{:02}", secs / 60, secs % 60)
+}
+
+#[cfg(test)]
+mod session_tests {
+    use super::*;
+
+    #[test]
+    fn sessions_saved_before_song_versions_still_load() {
+        let old = r#"{"queue":[{"id":"a","title":"A","artists":[],"album":null,"duration":null,"thumbs":[],"track_nr":null,"plays":null}],"index":0,"position_ms":5000,"duration_ms":0}"#;
+        let s: Session = serde_json::from_str(old).unwrap();
+        assert!(!s.queue[0].music_video && s.playing_as.is_none());
+        // A song (or a session without a song version) saves as before, so an older
+        // version, or a jam guest on one, reads it too.
+        let saved = serde_json::to_string(&s).unwrap();
+        assert!(!saved.contains("music_video") && !saved.contains("playing_as"), "{saved}");
+        let video = Track { music_video: true, ..s.queue[0].clone() };
+        let back: Track = serde_json::from_str(&serde_json::to_string(&video).unwrap()).unwrap();
+        assert!(back.music_video);
+    }
 }

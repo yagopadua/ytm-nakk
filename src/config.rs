@@ -134,8 +134,10 @@ mod tests {
     #[test]
     fn bindings_round_trip_through_disk() {
         let dir = std::env::temp_dir().join(format!("ytm-rs-hotkeys-{}", std::process::id()));
-        let mut config = HotkeyConfig::default();
-        config.next = HotkeyBinding::new(Modifiers::CONTROL | Modifiers::ALT, Code::KeyJ);
+        let config = HotkeyConfig {
+            next: HotkeyBinding::new(Modifiers::CONTROL | Modifiers::ALT, Code::KeyJ),
+            ..Default::default()
+        };
         save_hotkeys(&dir, &config).unwrap();
         assert_eq!(load_hotkeys(&dir), config);
         let _ = fs::remove_dir_all(&dir);
