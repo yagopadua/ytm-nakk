@@ -60,7 +60,7 @@ jobs:
       - name: Build portable zips
         run: |
           foreach ($b in @(@{ dir = "target\release"; suffix = "" }, @{ dir = "target\aarch64-pc-windows-msvc\release"; suffix = "-arm64" })) {
-            $out = "installer\Output\portable$($b.suffix)"
+            $out = "installer\Output\portable-$env:VERSION$($b.suffix)"
             New-Item -ItemType Directory -Force $out | Out-Null
             Copy-Item "$($b.dir)\ytm-rs.exe", installer\portable.txt, README.md, LICENSE $out
             & "$env:SystemRoot\System32\tar.exe" -a -c -f "installer\Output\ytm-rs-portable-$env:VERSION$($b.suffix).zip" -C $out ytm-rs.exe portable.txt README.md LICENSE
