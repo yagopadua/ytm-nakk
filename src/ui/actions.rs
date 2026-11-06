@@ -252,6 +252,11 @@ impl App {
     }
 
     pub(super) fn shortcuts(&mut self, ctx: &egui::Context) {
+        // The shortcut dialog is listening for a key combination; don't let
+        // Space or the arrows also act on the player while it's open.
+        if self.show_hotkey_modal {
+            return;
+        }
         let typing = ctx.egui_wants_keyboard_input();
         // In a text box, Ctrl+arrows move the cursor by words (and lines) instead; on a
         // focused button or slider they still skip and change the volume.

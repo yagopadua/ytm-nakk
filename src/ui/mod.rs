@@ -354,6 +354,12 @@ pub struct App {
     /// SponsorBlock segments for a video, and when one was last skipped.
     segments: Option<(String, Vec<crate::sponsorblock::Segment>)>,
     segment_skipped: f64,
+    /// Saved system-wide shortcuts, the ones registered, and the dialog state.
+    hotkey_config: crate::config::HotkeyConfig,
+    hotkeys: Option<crate::hotkeys::GlobalHotkeys>,
+    show_hotkey_modal: bool,
+    hotkey_action_to_edit: Option<crate::hotkeys::HotkeyCmd>,
+    hotkey_error: Option<String>,
     /// Background animation clock: advances only while music plays, so pausing
     /// freezes the motion instead of jumping when resumed.
     bg_time: f64,
@@ -490,7 +496,14 @@ impl App {
             let b = backend.clone();
             crate::transfer::Transfer::new(backend.data_dir(), Arc::new(move || b.wake()))
         };
+        let hotkey_config = crate::config::load_hotkeys(backend.data_dir());
+        let hotkeys = crate::hotkeys::GlobalHotkeys::new(&hotkey_config);
         let mut app = Self {
+            hotkey_config,
+            hotkeys,
+            show_hotkey_modal: false,
+            hotkey_action_to_edit: None,
+            hotkey_error: None,
             backend,
             audio,
             ch,
@@ -887,6 +900,277 @@ impl App {
 
 
 
+/// The `Code` for an egui key, for the keys a media shortcut makes sense on.
+fn hotkey_code(key: egui::Key) -> Option<global_hotkey::hotkey::Code> {
+    use egui::Key;
+    use global_hotkey::hotkey::Code;
+    Some(match key {
+        Key::A => Code::KeyA,
+        Key::B => Code::KeyB,
+        Key::C => Code::KeyC,
+        Key::D => Code::KeyD,
+        Key::E => Code::KeyE,
+        Key::F => Code::KeyF,
+        Key::G => Code::KeyG,
+        Key::H => Code::KeyH,
+        Key::I => Code::KeyI,
+        Key::J => Code::KeyJ,
+        Key::K => Code::KeyK,
+        Key::L => Code::KeyL,
+        Key::M => Code::KeyM,
+        Key::N => Code::KeyN,
+        Key::O => Code::KeyO,
+        Key::P => Code::KeyP,
+        Key::Q => Code::KeyQ,
+        Key::R => Code::KeyR,
+        Key::S => Code::KeyS,
+        Key::T => Code::KeyT,
+        Key::U => Code::KeyU,
+        Key::V => Code::KeyV,
+        Key::W => Code::KeyW,
+        Key::X => Code::KeyX,
+        Key::Y => Code::KeyY,
+        Key::Z => Code::KeyZ,
+        Key::Num0 => Code::Digit0,
+        Key::Num1 => Code::Digit1,
+        Key::Num2 => Code::Digit2,
+        Key::Num3 => Code::Digit3,
+        Key::Num4 => Code::Digit4,
+        Key::Num5 => Code::Digit5,
+        Key::Num6 => Code::Digit6,
+        Key::Num7 => Code::Digit7,
+        Key::Num8 => Code::Digit8,
+        Key::Num9 => Code::Digit9,
+        Key::ArrowUp => Code::ArrowUp,
+        Key::ArrowDown => Code::ArrowDown,
+        Key::ArrowLeft => Code::ArrowLeft,
+        Key::ArrowRight => Code::ArrowRight,
+        Key::Space => Code::Space,
+        Key::Enter => Code::Enter,
+        Key::Tab => Code::Tab,
+        Key::Backspace => Code::Backspace,
+        Key::Delete => Code::Delete,
+        Key::Insert => Code::Insert,
+        Key::Home => Code::Home,
+        Key::End => Code::End,
+        Key::PageUp => Code::PageUp,
+        Key::PageDown => Code::PageDown,
+        Key::Minus => Code::Minus,
+        Key::Plus | Key::Equals => Code::Equal,
+        Key::Comma => Code::Comma,
+        Key::Period => Code::Period,
+        Key::Semicolon => Code::Semicolon,
+        Key::Slash => Code::Slash,
+        Key::Backslash => Code::Backslash,
+        Key::OpenBracket => Code::BracketLeft,
+        Key::CloseBracket => Code::BracketRight,
+        Key::Backtick => Code::Backquote,
+        _ => return None,
+    })
+}
+
+/// The held modifier keys, as the bits `global_hotkey` registers.
+fn hotkey_modifiers(modifiers: egui::Modifiers) -> global_hotkey::hotkey::Modifiers {
+    use global_hotkey::hotkey::Modifiers;
+    let mut out = Modifiers::empty();
+    if modifiers.ctrl {
+        out |= Modifiers::CONTROL;
+    }
+    if modifiers.alt {
+        out |= Modifiers::ALT;
+    }
+    if modifiers.shift {
+        out |= Modifiers::SHIFT;
+    }
+    // `mac_cmd` is the Windows/Super key off macOS; `command` is just Ctrl there.
+    if modifiers.mac_cmd {
+        out |= Modifiers::SUPER;
+    }
+    out
+}
+
+/// `Ctrl + Alt`, the modifier keys held right now, for the capture prompt.
+fn held_label(modifiers: egui::Modifiers) -> String {
+    let mut parts = Vec::new();
+    if modifiers.ctrl {
+        parts.push("Ctrl");
+    }
+    if modifiers.alt {
+        parts.push("Alt");
+    }
+    if modifiers.shift {
+        parts.push("Shift");
+    }
+    if modifiers.mac_cmd {
+        parts.push("Super");
+    }
+    parts.join(" + ")
+}
+
+impl App {
+    /// Registers the shortcuts whose combinations are in `hotkey_config`.
+    fn register_hotkeys(&mut self) {
+        // Drop the old manager first: the system still considers its
+        // combinations taken until it's gone, so registering again would fail.
+        self.hotkeys = None;
+        self.hotkeys = crate::hotkeys::GlobalHotkeys::new(&self.hotkey_config);
+    }
+
+    /// Saves the shortcuts and registers them again, so a change applies at once.
+    fn apply_hotkeys(&mut self) {
+        if let Err(e) = crate::config::save_hotkeys(self.backend.data_dir(), &self.hotkey_config) {
+            log::warn!("could not save the keyboard shortcuts: {e}");
+        }
+        self.register_hotkeys();
+    }
+
+    fn draw_hotkey_modal(&mut self, ctx: &egui::Context) {
+        if !self.show_hotkey_modal {
+            return;
+        }
+
+        let (events, held) = ctx.input(|i| (i.events.clone(), i.modifiers));
+        let pressed = |key: egui::Key| {
+            events.iter().any(|e| matches!(e, egui::Event::Key { key: k, pressed: true, .. } if *k == key))
+        };
+
+        // While a combination is being captured, Escape goes back to the list;
+        // otherwise it closes the dialog. The shortcuts are unregistered during
+        // capture, so pressing the old combination doesn't also play a song.
+        if pressed(egui::Key::Escape) {
+            if self.hotkey_action_to_edit.is_some() {
+                self.hotkey_action_to_edit = None;
+                self.hotkey_error = None;
+                self.register_hotkeys();
+            } else {
+                self.show_hotkey_modal = false;
+            }
+            return;
+        }
+
+        if let Some(cmd) = self.hotkey_action_to_edit {
+            for event in &events {
+                let egui::Event::Key { key, pressed: true, .. } = event else { continue };
+                let Some(code) = hotkey_code(*key) else { continue };
+                let modifiers = hotkey_modifiers(held);
+                // A bare key would be taken from every app on the system, not
+                // just from this one.
+                if modifiers.is_empty() {
+                    self.hotkey_error = Some("Hold Ctrl, Alt, Shift or Super as well.".to_owned());
+                    break;
+                }
+                let binding = crate::config::HotkeyBinding::new(modifiers, code);
+                let taken = crate::hotkeys::HotkeyCmd::ALL
+                    .into_iter()
+                    .find(|other| *other != cmd && *self.hotkey_config.binding(*other) == binding);
+                if let Some(taken) = taken {
+                    self.hotkey_error = Some(format!("{} is already used for {}.", binding.label(), taken.label()));
+                    break;
+                }
+                *self.hotkey_config.binding_mut(cmd) = binding;
+                self.apply_hotkeys();
+                self.hotkey_action_to_edit = None;
+                self.hotkey_error = None;
+                break;
+            }
+        }
+
+        let mut edit = None;
+        let mut done = false;
+        egui::Modal::new(egui::Id::NULL.with("hotkey_modal"))
+            .frame(notes::surface())
+            .backdrop_color(theme::shade(0.55))
+            .show(ctx, |ui| {
+                ui.set_width(440.0_f32.min(ctx.content_rect().width() - 48.0));
+                egui::Frame::new()
+                    .inner_margin(egui::Margin { left: 26, right: 26, top: 24, bottom: 22 })
+                    .show(ui, |ui| {
+                        ui.spacing_mut().item_spacing = egui::vec2(0.0, 0.0);
+                        ui.label(egui::RichText::new("Keyboard shortcuts").font(theme::bold(22.0)).color(theme::text()));
+                        ui.add_space(6.0);
+                        match self.hotkey_action_to_edit {
+                            Some(cmd) => {
+                                ui.label(
+                                    egui::RichText::new(format!("Press the new combination for {}.", cmd.label().to_lowercase()))
+                                        .font(theme::regular(13.0))
+                                        .color(theme::text_dim()),
+                                );
+                                ui.add_space(16.0);
+                                let combo = held_label(held);
+                                ui.label(
+                                    egui::RichText::new(if combo.is_empty() { "Waiting for a key".to_owned() } else { format!("{combo} + …") })
+                                        .font(theme::semibold(17.0))
+                                        .color(theme::text()),
+                                );
+                                if let Some(error) = &self.hotkey_error {
+                                    ui.add_space(10.0);
+                                    ui.label(egui::RichText::new(error).font(theme::regular(12.5)).color(theme::RED));
+                                }
+                                ui.add_space(20.0);
+                                ui.horizontal(|ui| {
+                                    if widgets::pill(ui, "Cancel", None, false).clicked() {
+                                        self.hotkey_action_to_edit = None;
+                                        self.hotkey_error = None;
+                                        self.register_hotkeys();
+                                    }
+                                    ui.add_space(10.0);
+                                    if widgets::pill(ui, "Reset", None, false).clicked() {
+                                        *self.hotkey_config.binding_mut(cmd) =
+                                            crate::config::HotkeyConfig::default().binding(cmd).clone();
+                                        self.hotkey_error = None;
+                                        self.apply_hotkeys();
+                                    }
+                                });
+                            }
+                            None => {
+                                ui.label(
+                                    egui::RichText::new("These work even when ytm-rs isn't the active window.")
+                                        .font(theme::regular(13.0))
+                                        .color(theme::text_dim()),
+                                );
+                                ui.add_space(14.0);
+                                for cmd in crate::hotkeys::HotkeyCmd::ALL {
+                                    let combo = self.hotkey_config.binding(cmd).label();
+                                    pages::setting_row(ui, cmd.label(), Some(&combo), |ui| {
+                                        if widgets::pill(ui, "Change", None, false).clicked() {
+                                            edit = Some(cmd);
+                                        }
+                                    });
+                                }
+                                if let Some(hotkeys) = &self.hotkeys
+                                    && !hotkeys.failed().is_empty()
+                                {
+                                    let names: Vec<&str> = hotkeys.failed().iter().map(|cmd| cmd.label()).collect();
+                                    ui.add_space(10.0);
+                                    ui.label(
+                                        egui::RichText::new(format!(
+                                            "The system wouldn't give ytm-rs the shortcut for {}. Another app may be using it.",
+                                            names.join(", ").to_lowercase()
+                                        ))
+                                        .font(theme::regular(12.5))
+                                        .color(theme::RED),
+                                    );
+                                }
+                                ui.add_space(14.0);
+                                done = widgets::pill(ui, "Done", None, true).clicked();
+                            }
+                        }
+                    });
+            });
+
+        if let Some(cmd) = edit {
+            self.hotkey_action_to_edit = Some(cmd);
+            self.hotkey_error = None;
+            // Unregister until the new combination is known, so the old one
+            // doesn't act while it's being replaced.
+            self.hotkeys = None;
+        }
+        if done {
+            self.show_hotkey_modal = false;
+        }
+    }
+}
+
 impl eframe::App for App {
     /// With a window material, nothing under the pages but what they paint.
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
@@ -894,12 +1178,32 @@ impl eframe::App for App {
     }
 
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Ctrl +, Ctrl - and Ctrl 0 would zoom the UI instead of reaching a
+        // system-wide shortcut the user picked.
+        ctx.options_mut(|o| o.zoom_with_keyboard = false);
         dev_pace();
         self.lyric_view.release_hidden(ctx.cumulative_pass_nr());
         let now = ctx.input(|i| i.time);
         self.sync_look();
         self.pump(now);
         self.skip_segments(ctx, now);
+        if let Some(hk) = &self.hotkeys
+            && let Some(cmd) = hk.poll()
+        {
+            match cmd {
+                crate::hotkeys::HotkeyCmd::TogglePlay => self.toggle(),
+                crate::hotkeys::HotkeyCmd::Next => self.next(),
+                crate::hotkeys::HotkeyCmd::Prev => self.prev(),
+                crate::hotkeys::HotkeyCmd::VolumeUp => {
+                    let v = (self.audio.volume() + 0.05).clamp(0.0, 1.0);
+                    self.audio.set_volume(v);
+                }
+                crate::hotkeys::HotkeyCmd::VolumeDown => {
+                    let v = (self.audio.volume() - 0.05).clamp(0.0, 1.0);
+                    self.audio.set_volume(v);
+                }
+            }
+        }
         // System media controls and taskbar buttons follow the player however it changed.
         let playing = self.playing() || self.buffering;
         if let Some(m) = &mut self.media {
@@ -1124,6 +1428,7 @@ impl eframe::App for App {
             theme::set_mode(&ctx, pages);
         }
         self.draw_dialog(&ctx);
+        self.draw_hotkey_modal(&ctx);
         notes::card(self, &ctx);
         notes::dialog(self, &ctx);
         if let Some(url) = self.share_pending.take() { ctx.copy_text(url); }
