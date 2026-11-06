@@ -935,7 +935,7 @@ fn settings_body(app: &mut App, ui: &mut Ui) {
     settings_card(ui, |ui| network(app, ui));
     super::transfer::settings_section(app, ui);
     settings_updates(app, ui);
-    settings_shortcuts(ui);
+    settings_shortcuts(app, ui);
     settings_about(ui);
     settings_sign_off(app, ui);
 }
@@ -1540,9 +1540,14 @@ fn settings_updates(app: &mut App, ui: &mut Ui) {
 }
 
 /// Settings › Keyboard shortcuts.
-fn settings_shortcuts(ui: &mut Ui) {
+fn settings_shortcuts(app: &mut App, ui: &mut Ui) {
     section_label(ui, "Keyboard shortcuts", None);
     settings_card(ui, |ui| {
+        setting_row(ui, "Media controls", Some("Play, skip and volume controls that work even when ytm-rs isn't the active window."), |ui| {
+            if pill(ui, "Edit shortcuts", None, false).clicked() {
+                app.show_hotkey_modal = true;
+            }
+        });
         let keys: &[(&str, &[&str])] = &[
             ("Play / pause", &["Space"]),
             ("Next / previous song", &["Ctrl", "→ / ←"]),

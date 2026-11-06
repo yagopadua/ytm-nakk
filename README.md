@@ -58,6 +58,7 @@
 
 **Desktop**
 - System media controls, taskbar thumbnail buttons, close to tray, a collapsible sidebar and screen-reader-accessible controls. On Windows, the app draws its own title bar so the window is one surface.
+- **Global media hotkeys:** play/pause, next, previous and volume work while another app is focused. Rebind them in Settings › Keyboard shortcuts.
 - Automatic updates in the background for both the installed and portable versions, with release notes when an update is ready.
 
 ## Screenshots
