@@ -1,0 +1,50 @@
+name: Sync Upstream and Release Build
+
+on:
+  schedule:
+    # Executa automaticamente toda madrugada (ex: 03:00 UTC)
+    - cron: '0 3 * * *'
+  # Permite acionar manualmente com um clique na aba Actions
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  sync-and-build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout do Repositório
+        uses: actions/checkout@v4
+        with:
+          ref: custom-features
+          fetch-depth: 0
+
+      - name: Sincronizar com o Repositório Oficial
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git remote add upstream https://github.com/grapedjuice/ytm-rs.git
+          git fetch upstream
+          # Traz as novidades da branch principal oficial para sua branch customizada
+          git merge upstream/main --no-edit || git merge upstream/master --no-edit
+          git push origin custom-features
+
+      - name: Instalar Rust Toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache de Dependências
+        uses: Swatinem/rust-cache@v2
+
+      - name: Compilar o Executável (.exe)
+        run: cargo build --release
+
+      - name: Criar Release Automática
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: latest-build
+          name: Versão Atualizada (com Global Hotkeys)
+          files: target/release/ytm-rs.exe
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
